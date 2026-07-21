@@ -13,9 +13,9 @@ If you don't use this convention, just ignore this file: Chronicle scans your vi
 regardless, and you build the chronological order in the app.
 
 > **Note on upload order:** Chronicle derives the **Upload** view from each file's
-> embedded upload date, *not* from folder names. The `(Upload #N)` tag below is still
-> part of the recognized folder pattern (a folder must have it to be auto-imported),
-> but the number itself no longer drives ordering. Think of it as an optional label.
+> embedded upload date, *not* from folder names. The `(Upload #N)` tag is therefore
+> **optional** — a folder is recognized with or without it. Keeping it is still
+> **recommended** as human-readable documentation of the release sequence.
 
 ---
 
@@ -27,12 +27,26 @@ Each season folder is named:
 season <CODE> - <optional title> - (Upload #<N>)
 ```
 
-- `<CODE>` — encodes the season / sub-season / side-story (grammar below).
-- `<optional title>` — free text; may be omitted, and may itself contain " - ".
-- `(Upload #<N>)` — a number. **Must be present** for the folder to be recognized.
-  The dash right before it is optional.
+Reading the parts left to right:
+
+- **`season`** — the literal keyword that marks a folder as a season for the importer.
+  A folder that doesn't start with `season ` is skipped (its videos still show up in the
+  app, just unplaced).
+- **`<CODE>`** — the structural identifier: which season, sub-season, and/or side-story
+  this folder is. This is the only part Chronicle uses to build the order. Grammar below.
+- **`<optional title>`** — free-text label for your own reference (e.g. `Origins`,
+  `Detours`). Purely cosmetic: it may be omitted, and may itself contain ` - ` or other
+  punctuation. Chronicle ignores it (episode titles come from the file names instead).
+- **`(Upload #<N>)`** — records the position this folder held in the channel's **upload
+  timeline** — i.e. it was the `N`-th thing uploaded (`#01` = first upload, `#02` = second,
+  …). It's a documentation label only: **optional**, and the number does not drive
+  ordering (the Upload view reads real dates from the files). The dash right before it is
+  optional too. Recommended to keep so the release order is legible from the folder names.
 
 ### The `<CODE>` grammar
+
+The code answers three questions: *which season*, *which part of it* (sub-season), and
+*is it a side-story*.
 
 Notation: `NN` = a two-digit number (e.g. `01`, `00`, `12`). `<letter>` = a single
 lowercase letter (`a`, `b`, `c`, …).
@@ -40,13 +54,40 @@ lowercase letter (`a`, `b`, `c`, …).
 | Pattern | Meaning | Example code |
 |---------|---------|--------------|
 | `NN` | main season | `01` |
-| `NNxNN` | main season with a **sub-season** | `00x03` |
+| `NNxNN` | main season split into a **sub-season** | `00x03` |
 | `NN<letter>` | main season with a **side-story** | `01b` |
 | `NNxNN<letter>` | main season, sub-season, **and** side-story | `00x01a` |
 
 - The first `NN` is the **season number**.
-- `x NN` (if present) is the **sub-season** number.
-- A trailing `<letter>` marks a **side-story** (a, b, c… = 1st, 2nd, 3rd side-story).
+- `xNN` (if present) is the **sub-season** number — see below.
+- A trailing `<letter>` marks a **side-story** (`a`, `b`, `c`… = 1st, 2nd, 3rd side-story).
+
+#### What is a "sub-season"?
+
+A **sub-season** is a self-contained block of episodes that lives *under* a season number
+but functions like its own season — without being promoted to the next season number.
+
+The classic case: a show releases **Season 1 in three parts**. Each part is its own arc
+with its own beginning and end and feels like a standalone season, but the creator never
+called any of them "Season 2" — officially they're all still Season 1. You'd encode them:
+
+```
+season 01x01 - Part 1 - (Upload #01)
+season 01x02 - Part 2 - (Upload #04)
+season 01x03 - Part 3 - (Upload #07)
+```
+
+All three share season number `1`, and the `x01` / `x02` / `x03` keep them in order and
+distinct. The next *real* season then becomes `season 02`. (In this collection, the
+`season 0` prequel material is split the same way: `00x01`, `00x02`, `00x03`.)
+
+#### What is a "side-story"?
+
+A **side-story** is a bonus or special that hangs off a season (or sub-season) but isn't
+part of the main storyline — a holiday special, a spin-off mini-arc, a one-off. The
+trailing letter attaches it to its parent: `03a` is the first side-story of season 3;
+`00x01a` is the first side-story of season 0's first sub-season. In the app these get a
+`+` on their badge (e.g. `[S3+]`).
 
 ### Within a season folder
 
@@ -116,6 +157,8 @@ manual order is saved and the folder names never need to change again.
 - **File type / layout:** only `.mkv` files are discovered today, sitting directly
   inside their folder. (No convention is needed for the Upload view — that comes from
   embedded dates.)
+- **The `(Upload #N)` tag:** optional. Folders are recognized with or without it; it's
+  recommended only as a human-readable note of the release sequence.
 - **Keeping this structure:** once imported, reorganize freely. Chronicle tracks each
   video by content, so moving, renaming, or flattening folders keeps everything intact.
 - **Perfect names:** folders that don't match the pattern are simply skipped by the

@@ -50,7 +50,8 @@ SCHEMA_VERSION = 2
 CHUNK = 1024 * 1024  # 1 MiB fingerprint chunk
 
 SEASON_RE = re.compile(
-    r"^season (?P<code>\S+)\s*-?\s*(?P<title>.*?)\s*-?\s*\(Upload #(?P<upload>\d+)\)$"
+    r"^season (?P<code>\S+)\s*-?\s*(?P<title>.*?)"
+    r"\s*(?:-?\s*\(Upload #(?P<upload>\d+)\))?$"
 )
 CODE_RE = re.compile(r"^(\d+)(?:x(\d+))?([a-z]*)$")
 EP_PREFIX_RE = re.compile(r"^\d+\s*-\s*")
@@ -103,12 +104,15 @@ def clean_title(filename: str) -> str:
 
 
 def parse_season_folder(folder: str):
-    """Return (code, upload:int, season:int|None, side_story:bool) or None."""
+    """Return (code, upload:int|None, season:int|None, side_story:bool) or None.
+
+    The '(Upload #N)' tag is optional; upload is None when it's absent.
+    """
     m = SEASON_RE.match(folder)
     if not m:
         return None
     code = m.group("code")
-    upload = int(m.group("upload"))
+    upload = int(m.group("upload")) if m.group("upload") else None
     cm = CODE_RE.match(code)
     season = int(cm.group(1)) if cm else None
     side_story = bool(cm.group(3)) if cm else False
@@ -1165,6 +1169,10 @@ def selftest() -> int:
     check("multi-dash title (00x03a)",
           parse_season_folder("season 00x03a - Side Arc - The Move (Upload #01)")
           == ("00x03a", 1, 0, True))
+    check("upload tag optional (bare code)",
+          parse_season_folder("season 01") == ("01", None, 1, False))
+    check("upload tag optional (with title, no tag)",
+          parse_season_folder("season 02a - Detours") == ("02a", None, 2, True))
 
     print("2. code_sort_key -> canonical chronological order")
     codes = [parse_season_folder(f)[0] for f in SAMPLE_FOLDERS]
