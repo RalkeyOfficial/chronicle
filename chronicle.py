@@ -1193,10 +1193,30 @@ def run_gui(lib: Library) -> int:
             reset = box.addButton("Reset orders", QMessageBox.DestructiveRole)
             merge = box.addButton("Merge", QMessageBox.AcceptRole)
             box.addButton(QMessageBox.Cancel)
+            box.setDefaultButton(box.button(QMessageBox.Cancel))
             box.exec()
             clicked = box.clickedButton()
             if clicked not in (reset, merge):
                 return
+            # Reset is destructive: it discards the hand-arranged orders. Make
+            # the user confirm that explicitly before overwriting anything.
+            if clicked is reset:
+                confirm = QMessageBox(None)
+                confirm.setWindowModality(Qt.ApplicationModal)
+                confirm.setIcon(QMessageBox.Warning)
+                confirm.setWindowTitle("Reset orders?")
+                confirm.setText(
+                    "This overwrites BOTH orders with the folder-derived order, "
+                    "discarding your current chronological arrangement and any "
+                    "Upload-view nudges.\n\n"
+                    "Notes and watched-state are kept. This cannot be undone."
+                )
+                yes = confirm.addButton("Reset and overwrite", QMessageBox.DestructiveRole)
+                confirm.addButton(QMessageBox.Cancel)
+                confirm.setDefaultButton(confirm.button(QMessageBox.Cancel))
+                confirm.exec()
+                if confirm.clickedButton() is not yes:
+                    return
             summary = self.lib.import_from_folders(reset_orders=(clicked is reset))
             self.lib.save()
             self.refresh_lists()
