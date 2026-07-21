@@ -435,7 +435,7 @@ def resolve_player() -> tuple[str, str | None]:
 
 def run_gui(lib: Library) -> int:
     from PySide6.QtCore import Qt, QDate, QProcess, QTimer, QUrl, Signal
-    from PySide6.QtGui import QColor, QDesktopServices
+    from PySide6.QtGui import QColor, QDesktopServices, QKeySequence, QShortcut
     from PySide6.QtWidgets import (
         QAbstractItemView, QApplication, QCheckBox, QComboBox, QDateEdit,
         QDialog, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget,
@@ -460,6 +460,26 @@ def run_gui(lib: Library) -> int:
         def dropEvent(self, e):
             super().dropEvent(e)
             self.reordered.emit()
+
+    class FindEdit(QLineEdit):
+        """A search box that behaves like a browser find bar.
+
+        Enter → next match, Shift+Enter → previous, Esc → dismiss. It never
+        consumes those keys for anything else, so the parent drives navigation.
+        """
+        nextMatch = Signal()
+        prevMatch = Signal()
+        dismissed = Signal()
+
+        def keyPressEvent(self, e):
+            if e.key() in (Qt.Key_Return, Qt.Key_Enter):
+                (self.prevMatch if e.modifiers() & Qt.ShiftModifier
+                 else self.nextMatch).emit()
+                return
+            if e.key() == Qt.Key_Escape:
+                self.dismissed.emit()
+                return
+            super().keyPressEvent(e)
 
     class Window(QMainWindow):
         def __init__(self):
@@ -591,6 +611,43 @@ def run_gui(lib: Library) -> int:
             row.addWidget(watched_btn)
             row.addWidget(self.remove_btn)
             lv.addLayout(row)
+
+            # Find bar (Ctrl+F): browser-style search that navigates, never
+            # filters. Hidden until opened; targets whichever list has focus.
+            self.find_bar = QWidget()
+            fb = QHBoxLayout(self.find_bar)
+            fb.setContentsMargins(0, 0, 0, 0)
+            self.find_edit = FindEdit()
+            self.find_edit.setPlaceholderText(
+                "Find title…  (Enter / Shift+Enter to step, Esc to close)"
+            )
+            self.find_edit.setClearButtonEnabled(True)
+            self.find_edit.textChanged.connect(self.on_find_text)
+            self.find_edit.nextMatch.connect(self.find_next)
+            self.find_edit.prevMatch.connect(self.find_prev)
+            self.find_edit.dismissed.connect(self.close_find)
+            self.find_count = QLabel("")
+            self.find_count.setStyleSheet("color: gray;")
+            find_prev_btn = QPushButton("▲")
+            find_prev_btn.setFixedWidth(32)
+            find_prev_btn.setToolTip("Previous match (Shift+Enter / Shift+F3)")
+            find_prev_btn.clicked.connect(self.find_prev)
+            find_next_btn = QPushButton("▼")
+            find_next_btn.setFixedWidth(32)
+            find_next_btn.setToolTip("Next match (Enter / F3)")
+            find_next_btn.clicked.connect(self.find_next)
+            find_close_btn = QPushButton("✕")
+            find_close_btn.setFixedWidth(32)
+            find_close_btn.setToolTip("Close find (Esc)")
+            find_close_btn.clicked.connect(self.close_find)
+            fb.addWidget(QLabel("Find:"))
+            fb.addWidget(self.find_edit, 1)
+            fb.addWidget(self.find_count)
+            fb.addWidget(find_prev_btn)
+            fb.addWidget(find_next_btn)
+            fb.addWidget(find_close_btn)
+            self.find_bar.hide()
+            lv.addWidget(self.find_bar)
             split.addWidget(left)
 
             right = QWidget()
@@ -704,6 +761,14 @@ def run_gui(lib: Library) -> int:
             self._selected_fp: str | None = None
             self._loading_details = False
 
+            # Find-in-list state + keyboard shortcuts (browser-style).
+            self._find_list = self.main_list   # which list find navigates
+            self._find_matches: list[int] = []  # matching row indices in it
+            self._find_pos = 0
+            QShortcut(QKeySequence.Find, self).activated.connect(self.open_find)
+            QShortcut(QKeySequence.FindNext, self).activated.connect(self.find_next)
+            QShortcut(QKeySequence.FindPrevious, self).activated.connect(self.find_prev)
+
             if not player_exe:
                 QMessageBox.warning(
                     None, "No player found",
@@ -755,6 +820,74 @@ def run_gui(lib: Library) -> int:
                 f"{online} videos on disk · {len(self.lib.videos)} known · "
                 f"{self.unsorted_list.count()} unsorted in this order"
             )
+
+            # Rows were rebuilt, so any find matches (row indices) are stale.
+            if self.find_bar.isVisible():
+                self.on_find_text()
+
+        # ---- find in list (browser-style) --------------------------------- #
+        def open_find(self):
+            # Target the focused list if it's one of ours; else the main list.
+            focused = QApplication.focusWidget()
+            self._find_list = (self.unsorted_list if focused is self.unsorted_list
+                               else self.main_list)
+            self.find_bar.show()
+            self.find_edit.selectAll()
+            self.find_edit.setFocus()
+            self.on_find_text()
+
+        def close_find(self):
+            self.find_bar.hide()
+            if self._find_list is not None:
+                self._find_list.setFocus()
+
+        def on_find_text(self, *args):
+            """Recompute which rows match, then jump to the nearest one."""
+            query = self.find_edit.text().strip().lower()
+            lst = self._find_list or self.main_list
+            self._find_matches = []
+            if query:
+                for i in range(lst.count()):
+                    fp = lst.item(i).data(FP_ROLE)
+                    title = self.lib.videos.get(fp, {}).get("title", "").lower()
+                    if query in title:
+                        self._find_matches.append(i)
+            if self._find_matches:
+                # Start from the first match at or after the current row.
+                cur = lst.currentRow()
+                self._find_pos = next(
+                    (j for j, row in enumerate(self._find_matches) if row >= cur), 0
+                )
+                self._select_match()
+            self._update_find_count()
+
+        def find_next(self):
+            if self._find_matches:
+                self._find_pos = (self._find_pos + 1) % len(self._find_matches)
+                self._select_match()
+                self._update_find_count()
+
+        def find_prev(self):
+            if self._find_matches:
+                self._find_pos = (self._find_pos - 1) % len(self._find_matches)
+                self._select_match()
+                self._update_find_count()
+
+        def _select_match(self):
+            lst = self._find_list
+            if not self._find_matches or lst is None:
+                return
+            row = self._find_matches[self._find_pos]
+            lst.setCurrentRow(row)          # selects + loads details, keeps find focus
+            lst.scrollToItem(lst.item(row))
+
+        def _update_find_count(self):
+            if not self.find_edit.text().strip():
+                self.find_count.setText("")
+            elif not self._find_matches:
+                self.find_count.setText("No matches")
+            else:
+                self.find_count.setText(f"{self._find_pos + 1} of {len(self._find_matches)}")
 
         # ---- actions ------------------------------------------------------ #
         def _apply_mode(self):
@@ -1012,6 +1145,11 @@ def run_gui(lib: Library) -> int:
                 "episode out of <i>this</i> order only — nothing is ever deleted.</p>"
                 "<p><b>Details</b> also edits title, season, watched, notes, and a "
                 "<b>Side story</b> flag (adds a '+' to the badge; doesn't move anything).</p>"
+                "<h4>Find</h4>"
+                "<p>Press <b>Ctrl+F</b> to search titles in the focused list. Like a "
+                "browser, it doesn't hide anything — it just steps the selection through "
+                "matching episodes. <b>Enter</b> / <b>F3</b> = next match, "
+                "<b>Shift+Enter</b> / <b>Shift+F3</b> = previous, <b>Esc</b> closes it.</p>"
                 "<p>Row format: <code>✓ [S3+] Title</code> → watched, Season 3, side-story. "
                 "<code>[offline]</code> means the file isn't found right now (its order and "
                 "notes are kept).</p>"
