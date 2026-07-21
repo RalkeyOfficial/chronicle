@@ -396,6 +396,22 @@ class Library:
     def is_online(self, fp: str) -> bool:
         return fp in self.path_by_fp
 
+    def forget(self, fp: str) -> None:
+        """Erase all trace of a fingerprint from the store (never the file).
+
+        Removes its metadata, its place in both orders, any saved playback
+        position, and its fingerprint cache row. If the file is still on disk it
+        will simply be re-added as a fresh, blank entry on the next scan.
+        """
+        self.videos.pop(fp, None)
+        self.chrono_order = [x for x in self.chrono_order if x != fp]
+        self.upload_order = [x for x in self.upload_order if x != fp]
+        for key in self.position:
+            if self.position.get(key) == fp:
+                self.position[key] = None
+        self.fp_cache = {k: v for k, v in self.fp_cache.items() if v.get("fp") != fp}
+        self.path_by_fp.pop(fp, None)
+
     def unsorted(self, name: str) -> list[str]:
         """Online videos that don't appear in the given order.
 
@@ -439,7 +455,7 @@ def run_gui(lib: Library) -> int:
     from PySide6.QtWidgets import (
         QAbstractItemView, QApplication, QCheckBox, QComboBox, QDateEdit,
         QDialog, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget,
-        QListWidgetItem, QMainWindow, QMessageBox, QPlainTextEdit,
+        QListWidgetItem, QMainWindow, QMenu, QMessageBox, QPlainTextEdit,
         QProgressDialog, QPushButton, QSpinBox, QSplitter, QTextBrowser,
         QVBoxLayout, QWidget,
     )
@@ -761,6 +777,13 @@ def run_gui(lib: Library) -> int:
             self._selected_fp: str | None = None
             self._loading_details = False
 
+            # Right-click context menu on both lists.
+            for lst in (self.main_list, self.unsorted_list):
+                lst.setContextMenuPolicy(Qt.CustomContextMenu)
+                lst.customContextMenuRequested.connect(
+                    lambda pos, lw=lst: self._show_context_menu(lw, pos)
+                )
+
             # Find-in-list state + keyboard shortcuts (browser-style).
             self._find_list = self.main_list   # which list find navigates
             self._find_matches: list[int] = []  # matching row indices in it
@@ -1065,8 +1088,7 @@ def run_gui(lib: Library) -> int:
                     if it.data(FP_ROLE) == fp:
                         it.setText(self.label_for(fp))
 
-        def toggle_watched(self):
-            fp = self._current_fp(self.main_list)
+        def _toggle_watched(self, fp: str | None):
             if not fp:
                 return
             v = self.lib.videos.setdefault(fp, default_video(""))
@@ -1075,6 +1097,9 @@ def run_gui(lib: Library) -> int:
             self._refresh_row(fp)
             if fp == self._selected_fp:
                 self.watched_edit.setChecked(v["watched"])
+
+        def toggle_watched(self):
+            self._toggle_watched(self._current_fp(self.main_list))
 
         def add_to_order(self):
             fp = self._current_fp(self.unsorted_list)
@@ -1095,6 +1120,89 @@ def run_gui(lib: Library) -> int:
             self.lib.set_order(self.current_order, order)
             self.lib.save()
             self.refresh_lists()
+
+        # ---- context menu ------------------------------------------------- #
+        def _show_context_menu(self, lst, pos):
+            item = lst.itemAt(pos)
+            if item is None:
+                return
+            fp = item.data(FP_ROLE)
+            if not fp:
+                return
+            lst.setCurrentItem(item)  # right-click also selects + loads details
+            online = self.lib.is_online(fp)
+
+            menu = QMenu(self)
+            act_play = menu.addAction("▶ Play")
+            act_play.setEnabled(online and bool(player_exe))
+            act_open = menu.addAction("Open containing folder")
+            act_open.setEnabled(online)
+            menu.addSeparator()
+            act_watched = menu.addAction("Toggle watched")
+            act_add = act_remove = None
+            if self.current_order == "chrono":
+                if lst is self.main_list:
+                    act_remove = menu.addAction("Remove from this order")
+                else:
+                    act_add = menu.addAction("Add to this order")
+            menu.addSeparator()
+            act_delete = menu.addAction("Delete entry…")
+
+            chosen = menu.exec(lst.mapToGlobal(pos))
+            if chosen is None:
+                return
+            if chosen is act_play:
+                self.play(fp)
+            elif chosen is act_open:
+                self.open_containing_folder(fp)
+            elif chosen is act_watched:
+                self._toggle_watched(fp)
+            elif chosen is act_add:
+                self.add_to_order()
+            elif chosen is act_remove:
+                self.remove_from_order()
+            elif chosen is act_delete:
+                self.delete_entry(fp)
+
+        def open_containing_folder(self, fp: str):
+            path = self.lib.path_by_fp.get(fp)
+            if not path or not path.exists():
+                QMessageBox.warning(None, "Unavailable",
+                                    "This video is not currently on disk (offline).")
+                return
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.parent)))
+
+        def delete_entry(self, fp: str):
+            v = self.lib.videos.get(fp, {})
+            title = v.get("title", fp)
+            online = self.lib.is_online(fp)
+            box = QMessageBox(None)  # parentless: its X can't close the app
+            box.setWindowModality(Qt.ApplicationModal)
+            box.setIcon(QMessageBox.Warning)
+            box.setWindowTitle("Delete entry?")
+            tail = ("This file is still on disk, so it will reappear as a fresh, "
+                    "blank entry (no notes, unplaced) on the next scan."
+                    if online else
+                    "This entry is offline — no file on disk — so it will be gone "
+                    "for good.")
+            box.setText(
+                f"Remove “{title}” from Chronicle's library?\n\n"
+                "This erases its saved metadata (title, notes, watched-state, "
+                "season, date override) and its place in both orders. It does "
+                "NOT delete the video file.\n\n" + tail
+            )
+            yes = box.addButton("Delete entry", QMessageBox.DestructiveRole)
+            box.addButton(QMessageBox.Cancel)
+            box.setDefaultButton(box.button(QMessageBox.Cancel))
+            box.exec()
+            if box.clickedButton() is not yes:
+                return
+            self.lib.forget(fp)
+            self.lib.save()
+            if self._selected_fp == fp:
+                self._selected_fp = None
+            self.refresh_lists()
+            self.status.showMessage(f"Deleted entry: {title}", 4000)
 
         def on_help(self):
             # A parentless, independent top-level window. Being unparented means
@@ -1145,6 +1253,15 @@ def run_gui(lib: Library) -> int:
                 "episode out of <i>this</i> order only — nothing is ever deleted.</p>"
                 "<p><b>Details</b> also edits title, season, watched, notes, and a "
                 "<b>Side story</b> flag (adds a '+' to the badge; doesn't move anything).</p>"
+                "<h4>Right-click menu</h4>"
+                "<p><b>Right-click</b> any episode for quick actions: play it, "
+                "<b>open its containing folder</b> in your file manager, toggle "
+                "watched, add/remove it from the chronological order, or "
+                "<b>Delete entry</b>. Delete removes the episode's saved data and "
+                "its place in both orders — it <i>never</i> deletes the video file. "
+                "Use it to clear out a stale <code>[offline]</code> leftover after "
+                "you've re-downloaded an episode (a new download gets a new "
+                "fingerprint, so the old entry lingers as offline).</p>"
                 "<h4>Find</h4>"
                 "<p>Press <b>Ctrl+F</b> to search titles in the focused list. Like a "
                 "browser, it doesn't hide anything — it just steps the selection through "
@@ -1503,6 +1620,25 @@ def selftest() -> int:
     print("11. resolve_player returns a tuple")
     name, _exe = resolve_player()
     check("player name is a str", isinstance(name, str))
+
+    print("12. forget() purges an entry from everywhere in the store")
+    with tempfile.TemporaryDirectory() as td:
+        lib = Library(Path(td))
+        for fp in ("a", "b", "c"):
+            lib.videos[fp] = default_video(fp + ".mkv")
+        lib.chrono_order = ["a", "b", "c"]
+        lib.upload_order = ["c", "b", "a"]
+        lib.position = {"chrono": "b", "upload": "b"}
+        lib.fp_cache = {"/x/b.mkv": {"size": 1, "mtime": 2, "fp": "b"}}
+        lib.path_by_fp = {"a": Path(td) / "a.mkv", "b": Path(td) / "b.mkv"}
+        lib.forget("b")
+        check("removed from videos", "b" not in lib.videos)
+        check("removed from chrono_order", lib.chrono_order == ["a", "c"])
+        check("removed from upload_order", lib.upload_order == ["c", "a"])
+        check("cleared saved position", lib.position == {"chrono": None, "upload": None})
+        check("removed from fp_cache", lib.fp_cache == {})
+        check("removed from path_by_fp", "b" not in lib.path_by_fp)
+        check("untouched entries remain", "a" in lib.videos and "c" in lib.videos)
 
     print()
     if fails:
