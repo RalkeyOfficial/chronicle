@@ -27,6 +27,45 @@ All of that state is stored in **`chronicle_library.json`**, created in the fold
 run Chronicle on. Delete it and you start fresh; copy it alongside the videos and your
 setup travels with them.
 
+For **sharing** a setup with someone who has *different* copies of the same videos,
+Chronicle also records each video's **YouTube ID** (parsed from the embedded source
+link) as a secondary identity — it survives re-encoding, so a shared library can be
+matched to files at another resolution or bitrate. See **Sharing a library** below.
+
+---
+
+## Sharing a library
+
+Chronicle can hand your ordering and curation to someone else — or to your own second
+machine — without touching either side's personal state.
+
+- **Export library…** writes a shareable file containing both orders and the
+  *non-personal* metadata: titles, seasons, side-story flags, source links, and date
+  overrides. It deliberately **excludes** your notes, watched-marks, and resume
+  positions.
+- **Import library…** applies such a file to *your* copy of the videos. Each video is
+  matched **by its YouTube ID first** — so it works even when your downloads differ in
+  resolution, bitrate, or embedded subtitles — and falls back to matching **byte-identical
+  files** for videos with no embedded link. You choose **Reset** (adopt the shared order)
+  or **Merge** (append it to your own), exactly like *Re-import from folders*.
+
+Your notes and watched-state are always kept. For videos in the shared file that you
+**don't have** (no matching ID and no identical file), you pick what happens:
+
+- **Keep as `[offline]` entries** (default) — they hold their place in the order as
+  `[offline]` rows and **reconnect automatically** once you obtain a **byte-identical**
+  copy of the file. (A *different* encode of the same video currently comes in as a fresh,
+  unplaced entry — automatic reconnection across encodes is planned but not yet
+  implemented.)
+- **Skip** — they're left out entirely.
+
+Either way, the import finishes with a **summary that lists exactly which videos weren't
+in your copy**, so nothing happens silently.
+
+> **Note:** cross-encode matching needs a YouTube-sourced video ID, which comes from the
+> embedded link that yt-dlp writes. Videos with no link only match when the files are
+> identical.
+
 ---
 
 ## Requirements
@@ -149,6 +188,9 @@ kept until it returns.
   "Merge" just appends new videos. Your notes and watched marks are always kept.
 - **Refresh dates from files** — re-reads every file's upload date and link. Use it
   if you re-downloaded files. Your manual date overrides are kept.
+- **Export library…** / **Import library…** — share your ordering and curation, or apply
+  someone else's, without touching either side's notes or watched-marks. See
+  **[Sharing a library](#sharing-a-library)**.
 - **?  Help** — the in-app guide.
 
 ---

@@ -46,7 +46,15 @@ from pathlib import Path
 # --------------------------------------------------------------------------- #
 
 STORE_NAME = "chronicle_library.json"
-SCHEMA_VERSION = 2
+# Version of the on-disk store format (see save()/load()). The paired export
+# format has its own "format_version" (see export_library()). These two numbers
+# are how we stay backwards-compatible: ANY change to the store or export that an
+# older build couldn't read — a renamed/removed field, different semantics, or a
+# change to how the fingerprint KEY itself is computed (see fingerprint()) — must
+# bump the relevant number and add a migration branch keyed off the loaded value
+# (migrate_if_needed() already does this for schema < 2). Additive, ignorable
+# fields don't need a bump. Bump early rather than silently break an old store.
+SCHEMA_VERSION = 3  # v3 adds per-video "video_id"; the v<2 migration gate is unaffected
 CHUNK = 1024 * 1024  # 1 MiB fingerprint chunk
 
 SEASON_RE = re.compile(
@@ -56,6 +64,11 @@ SEASON_RE = re.compile(
 CODE_RE = re.compile(r"^(\d+)(?:x(\d+))?([a-z]*)$")
 EP_PREFIX_RE = re.compile(r"^\d+\s*-\s*")
 DATE8_RE = re.compile(r"(\d{4})(\d{2})(\d{2})")  # YYYYMMDD anywhere in the tag
+# YouTube's 11-char video ID as it appears in the URLs yt-dlp embeds:
+# watch?v=<id>, youtu.be/<id>, /shorts/<id>, /embed/<id>.
+YOUTUBE_ID_RE = re.compile(
+    r"(?:v=|youtu\.be/|/shorts/|/embed/)([A-Za-z0-9_-]{11})(?![A-Za-z0-9_-])"
+)
 
 # Fullwidth / typographic substitutes yt-dlp uses for filesystem-illegal chars.
 FULLWIDTH = {
@@ -72,6 +85,14 @@ def fingerprint(path: Path) -> str:
     """Content identity: file size + blake2b of the first 1 MiB.
 
     Survives moving and renaming; only changes if the file content changes.
+
+    NOTE: this string is the KEY the whole store and export are built on. If you
+    ever change how it is computed (CHUNK size or the hash), every existing key
+    silently changes and old stores would match nothing. That is a breaking
+    change: bump SCHEMA_VERSION (and the export format_version), and add a
+    migration that recomputes on-disk files under both the old and new algorithm
+    and re-keys videos/chrono_order/upload_order/fp_cache/position (see forget()
+    for the shape of a re-key). Keep the old algorithm addressable to do so.
     """
     st = path.stat()
     h = hashlib.blake2b(digest_size=16)
@@ -135,6 +156,19 @@ def _date8_to_iso(value: str | None) -> str | None:
     return f"{y}-{mo}-{d}"
 
 
+def youtube_id(url: str | None) -> str | None:
+    """Extract the 11-char YouTube video ID from a source URL, else None.
+
+    Stable across re-encodes (resolution, bitrate, embedded subs), so it can
+    match the same video between people who hold different copies of the file.
+    Returns None for missing URLs or non-YouTube sources.
+    """
+    if not url:
+        return None
+    m = YOUTUBE_ID_RE.search(str(url))
+    return m.group(1) if m else None
+
+
 def read_embedded_meta(path: Path) -> dict:
     """Read upload date + source URL from a file's embedded tags via ffprobe.
 
@@ -181,6 +215,7 @@ def default_video(filename: str) -> dict:
         "upload_date": None,           # ISO "YYYY-MM-DD" read from the file
         "upload_date_override": None,  # ISO date the user sets to relocate it
         "url": None,                   # source URL read from the file
+        "video_id": None,              # YouTube ID parsed from url; cross-library key
         "meta_probed": False,          # have we tried ffprobe on this file yet
     }
 
@@ -230,6 +265,11 @@ class Library:
         self.position = {"chrono": pos.get("chrono"), "upload": pos.get("upload")}
         self.last_order = data.get("last_order", "chrono")
         self.schema_loaded = int(data.get("schema_version", 1))
+        # Backfill the cross-library video ID from URLs we already stored, so
+        # existing libraries gain it instantly (no ffprobe re-run needed).
+        for v in self.videos.values():
+            if v.get("url") and not v.get("video_id"):
+                v["video_id"] = youtube_id(v.get("url"))
 
     def save(self) -> None:
         data = {
@@ -324,6 +364,140 @@ class Library:
                     self.chrono_order.append(fp)
         return {"folders": len(folders), "videos": len(chrono)}
 
+    # ---- shareable library export / import ------------------------------- #
+    def export_library(self) -> dict:
+        """A shareable snapshot: both orders + non-personal per-video metadata.
+
+        Excludes everything personal (notes, watched, resume, last-opened,
+        saved position). Videos are keyed by this machine's fingerprint purely
+        as a within-file handle linking the orders to the metadata; a reader
+        matches videos by the embedded video_id (survives re-encodes) or, as a
+        fallback, by that same fingerprint (only if the files are identical).
+        """
+        videos = {}
+        for fp, v in self.videos.items():
+            videos[fp] = {
+                "video_id": v.get("video_id"),
+                "fingerprint": fp,
+                "title": v.get("title"),
+                "season": v.get("season"),
+                "side_story": bool(v.get("side_story")),
+                "upload_date": v.get("upload_date"),
+                "upload_date_override": v.get("upload_date_override"),
+                "url": v.get("url"),
+            }
+        return {
+            "app": "chronicle",
+            "kind": "library-export",
+            # Bump on any change import_library() of an older build couldn't read
+            # (including a fingerprint-algorithm change — see fingerprint()); gate
+            # a migration off the value read back in on_import_library().
+            "format_version": 1,
+            "exported_at": now_iso(),
+            "chrono_order": list(self.chrono_order),
+            "upload_order": list(self.upload_order),
+            "videos": videos,
+        }
+
+    def import_library(self, data: dict, reset_orders: bool = True,
+                       keep_unmatched: bool = False) -> dict:
+        """Apply a shared library's orders + curation onto the local videos.
+
+        Matches each exported video to a local one by video_id first (works
+        across different encodes), then by fingerprint (identical files only).
+        Applies structural metadata; never touches personal state (notes,
+        watched, resume, position).
+
+        A video in the file that you don't have (no matching id, no identical
+        file) is "missing". With keep_unmatched=True each missing video is kept
+        as an [offline] placeholder — carrying its title, order position and
+        metadata — so the ordering stays complete and it reconnects on its own
+        once a matching file appears. With keep_unmatched=False they are skipped.
+
+        Returns a summary dict for the caller to report.
+        """
+        exported = data.get("videos", {}) or {}
+        # Local lookup: which of our videos carries each video_id.
+        by_vid = {v["video_id"]: fp for fp, v in self.videos.items()
+                  if v.get("video_id")}
+
+        # Resolve every exported ref to a local fingerprint (or None if it was
+        # missing and we're skipping it).
+        ref_to_local: dict[str, str | None] = {}
+        by_video_id = by_fp = kept_offline = 0
+        missing_titles: list[str] = []
+        for ref, ev in exported.items():
+            vid = ev.get("video_id")
+            placeholder = False
+            if vid and vid in by_vid:
+                local = by_vid[vid]           # matched across encodes by id
+                by_video_id += 1
+            elif ref in self.videos:          # exporter fingerprint present locally
+                local = ref
+                by_fp += 1
+            else:                             # missing: we don't have this file
+                missing_titles.append(ev.get("title") or ref)
+                if keep_unmatched:
+                    # New offline entry keyed by the exporter's fingerprint, so a
+                    # later byte-identical download is recognized on the next scan.
+                    local = ref
+                    self.videos[ref] = default_video(ev.get("title") or "")
+                    kept_offline += 1
+                    placeholder = True
+                else:
+                    local = None
+            ref_to_local[ref] = local
+            if local is None:
+                continue
+            v = self.videos.setdefault(local, default_video(""))
+            if ev.get("title"):
+                v["title"] = ev["title"]
+            v["season"] = ev.get("season")
+            v["side_story"] = bool(ev.get("side_story"))
+            v["upload_date_override"] = ev.get("upload_date_override")
+            if placeholder:
+                # No local file to read from, so seed everything from the file.
+                v["url"] = ev.get("url")
+                v["video_id"] = ev.get("video_id")
+                v["upload_date"] = ev.get("upload_date")
+            elif not v.get("upload_date") and ev.get("upload_date"):
+                # Real local match: keep the file's own url/id/date; only fill a
+                # gap in the upload date.
+                v["upload_date"] = ev["upload_date"]
+
+        def translate(refs):
+            """Map exported refs -> local fps, dropping missing/skipped, de-duped."""
+            out, seen = [], set()
+            for ref in refs:
+                local = ref_to_local.get(ref)
+                if local is not None and local not in seen:
+                    out.append(local)
+                    seen.add(local)
+            return out
+
+        chrono = translate(data.get("chrono_order", []))
+        upload = translate(data.get("upload_order", []))
+        if reset_orders:
+            self.chrono_order = chrono
+            self.upload_order = upload
+        else:
+            for fp in chrono:  # merge: keep existing order, append new fps
+                if fp not in self.chrono_order:
+                    self.chrono_order.append(fp)
+            for fp in upload:
+                if fp not in self.upload_order:
+                    self.upload_order.append(fp)
+        return {
+            "total": len(exported),
+            "matched": by_video_id + by_fp,
+            "by_video_id": by_video_id,
+            "by_fingerprint": by_fp,
+            "missing": len(missing_titles),
+            "kept_offline": kept_offline,
+            "skipped": len(missing_titles) - kept_offline,
+            "missing_titles": missing_titles,
+        }
+
     # ---- embedded metadata (upload date + url) --------------------------- #
     def videos_missing_meta(self) -> list[str]:
         """Online videos whose embedded metadata hasn't been read yet."""
@@ -335,6 +509,7 @@ class Library:
         v = self.videos.setdefault(fp, default_video(""))
         v["upload_date"] = meta.get("upload_date")
         v["url"] = meta.get("url")
+        v["video_id"] = youtube_id(meta.get("url"))
         v["meta_probed"] = True
 
     def clear_meta_probed(self) -> None:
@@ -454,7 +629,7 @@ def run_gui(lib: Library) -> int:
     from PySide6.QtGui import QColor, QDesktopServices, QKeySequence, QShortcut
     from PySide6.QtWidgets import (
         QAbstractItemView, QApplication, QCheckBox, QComboBox, QDateEdit,
-        QDialog, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget,
+        QDialog, QFileDialog, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget,
         QListWidgetItem, QMainWindow, QMenu, QMessageBox, QPlainTextEdit,
         QProgressDialog, QPushButton, QSpinBox, QSplitter, QTextBrowser,
         QVBoxLayout, QWidget,
@@ -572,6 +747,25 @@ def run_gui(lib: Library) -> int:
                     "ffprobe not found — install ffmpeg to auto-read upload dates."
                 )
             bar.addWidget(self.refresh_dates_btn)
+
+            self.export_btn = QPushButton("Export library…")
+            self.export_btn.clicked.connect(self.on_export_library)
+            self.export_btn.setToolTip(
+                "Save this library's ordering and curation (titles, seasons, dates)\n"
+                "to a shareable file. Personal state — notes, watched-marks, resume\n"
+                "positions — is never included."
+            )
+            bar.addWidget(self.export_btn)
+
+            self.import_btn = QPushButton("Import library…")
+            self.import_btn.clicked.connect(self.on_import_library)
+            self.import_btn.setToolTip(
+                "Apply a shared library file to your own copy of the videos.\n"
+                "Matches videos by their YouTube ID (works across different\n"
+                "downloads/qualities), falling back to identical files.\n"
+                "Your notes and watched-marks are always kept."
+            )
+            bar.addWidget(self.import_btn)
 
             self.help_btn = QPushButton("?  Help")
             self.help_btn.clicked.connect(self.on_help)
@@ -1262,6 +1456,24 @@ def run_gui(lib: Library) -> int:
                 "Use it to clear out a stale <code>[offline]</code> leftover after "
                 "you've re-downloaded an episode (a new download gets a new "
                 "fingerprint, so the old entry lingers as offline).</p>"
+                "<h4>Sharing a library</h4>"
+                "<p><b>Export library…</b> saves this collection's ordering and "
+                "curation (titles, seasons, side-story flags, date overrides) to a "
+                "file you can share. It never includes personal state — notes, "
+                "watched-marks, or resume positions.</p>"
+                "<p><b>Import library…</b> applies such a file to <i>your</i> copy of "
+                "the videos. It matches each video by its <b>YouTube ID</b>, so it "
+                "works even if your downloads differ in resolution or bitrate; for "
+                "files with no embedded link it falls back to matching identical "
+                "files. Choose <b>Reset</b> to adopt the shared order or <b>Merge</b> "
+                "to append it to yours. Your own notes and watched-marks are always "
+                "kept.</p>"
+                "<p>For videos in the file that you don't have, you decide: leave "
+                "<b>Keep … as [offline] entries</b> ticked and they hold their place in "
+                "the order as <code>[offline]</code> rows that reconnect automatically "
+                "once you obtain the matching file; untick it to skip them entirely. "
+                "Either way, the import ends with a summary listing exactly which videos "
+                "weren't in your copy.</p>"
                 "<h4>Find</h4>"
                 "<p>Press <b>Ctrl+F</b> to search titles in the focused list. Like a "
                 "browser, it doesn't hide anything — it just steps the selection through "
@@ -1339,6 +1551,129 @@ def run_gui(lib: Library) -> int:
             self.refresh_lists()
             self.status.showMessage(
                 f"Imported {summary['videos']} videos from {summary['folders']} folders.", 5000
+            )
+
+        # ---- shareable library export / import --------------------------- #
+        def on_export_library(self):
+            default_name = f"{self.lib.root.name or 'chronicle'}.chronicle-library.json"
+            path, _ = QFileDialog.getSaveFileName(
+                self, "Export library", str(self.lib.root / default_name),
+                "Chronicle library (*.json);;All files (*)",
+            )
+            if not path:
+                return
+            try:
+                data = json.dumps(self.lib.export_library(), ensure_ascii=False, indent=2)
+                Path(path).write_text(data, encoding="utf-8")
+            except OSError as e:
+                QMessageBox.warning(None, "Export failed", f"Could not write the file:\n{e}")
+                return
+            self.status.showMessage(
+                f"Exported {len(self.lib.videos)} videos to {Path(path).name}", 5000
+            )
+
+        def on_import_library(self):
+            path, _ = QFileDialog.getOpenFileName(
+                self, "Import library", str(self.lib.root),
+                "Chronicle library (*.json);;All files (*)",
+            )
+            if not path:
+                return
+            try:
+                data = json.loads(Path(path).read_text(encoding="utf-8"))
+            except (OSError, ValueError, UnicodeError) as e:
+                QMessageBox.warning(None, "Import failed", f"Could not read the file:\n{e}")
+                return
+            if not isinstance(data, dict) or data.get("kind") != "library-export":
+                QMessageBox.warning(
+                    None, "Not a library file",
+                    "This file isn't a Chronicle library export.",
+                )
+                return
+
+            total = len(data.get("videos", {}) or {})
+            box = QMessageBox(None)  # parentless: its X can't close the app
+            box.setWindowModality(Qt.ApplicationModal)
+            box.setWindowTitle("Import library")
+            box.setText(
+                f"Apply a shared library ({total} videos) to your copy.\n\n"
+                "Videos are matched by their YouTube ID (works across different "
+                "downloads/qualities), then by identical files. Titles, seasons, "
+                "side-story flags and date overrides are applied; your notes, "
+                "watched-marks and resume positions are always kept.\n\n"
+                "• Reset: overwrite both your orders with the shared order.\n"
+                "• Merge: keep your current orders, just append shared videos."
+            )
+            keep_chk = QCheckBox("Keep videos you don't have yet as [offline] entries")
+            keep_chk.setChecked(True)
+            keep_chk.setToolTip(
+                "On: videos in the file that you don't have are kept as [offline] rows,\n"
+                "holding their place in the order and reconnecting automatically once a\n"
+                "matching file appears.\n"
+                "Off: those videos are skipped entirely (nothing added)."
+            )
+            box.setCheckBox(keep_chk)
+            reset = box.addButton("Reset orders", QMessageBox.DestructiveRole)
+            merge = box.addButton("Merge", QMessageBox.AcceptRole)
+            box.addButton(QMessageBox.Cancel)
+            box.setDefaultButton(box.button(QMessageBox.Cancel))
+            box.exec()
+            clicked = box.clickedButton()
+            if clicked not in (reset, merge):
+                return
+            keep_unmatched = keep_chk.isChecked()
+            if clicked is reset:
+                confirm = QMessageBox(None)
+                confirm.setWindowModality(Qt.ApplicationModal)
+                confirm.setIcon(QMessageBox.Warning)
+                confirm.setWindowTitle("Reset orders?")
+                confirm.setText(
+                    "This overwrites BOTH orders with the shared library's order, "
+                    "discarding your current chronological arrangement and any "
+                    "Upload-view nudges.\n\n"
+                    "Notes and watched-state are kept. This cannot be undone."
+                )
+                yes = confirm.addButton("Reset and overwrite", QMessageBox.DestructiveRole)
+                confirm.addButton(QMessageBox.Cancel)
+                confirm.setDefaultButton(confirm.button(QMessageBox.Cancel))
+                confirm.exec()
+                if confirm.clickedButton() is not yes:
+                    return
+
+            summary = self.lib.import_library(
+                data, reset_orders=(clicked is reset), keep_unmatched=keep_unmatched
+            )
+            self.lib.save()
+            self.refresh_lists()
+
+            # Results dialog — spell out exactly what happened, including which
+            # videos in the file aren't in your copy.
+            lines = [
+                f"Matched {summary['matched']} of {summary['total']} videos "
+                f"({summary['by_video_id']} by video ID, "
+                f"{summary['by_fingerprint']} by identical file)."
+            ]
+            if summary["kept_offline"]:
+                lines.append(
+                    f"Kept {summary['kept_offline']} video(s) you don't have yet as "
+                    "[offline] entries — they hold their place and reconnect when the "
+                    "matching file appears."
+                )
+            if summary["skipped"]:
+                lines.append(f"Skipped {summary['skipped']} video(s) you don't have.")
+            res = QMessageBox(None)
+            res.setWindowModality(Qt.ApplicationModal)
+            res.setWindowTitle("Import complete")
+            res.setText("\n\n".join(lines))
+            if summary["missing_titles"]:
+                res.setDetailedText(
+                    "Videos in the shared library but not in your copy:\n\n"
+                    + "\n".join("• " + t for t in summary["missing_titles"])
+                )
+            res.exec()
+            self.status.showMessage(
+                f"Imported: {summary['matched']} of {summary['total']} matched · "
+                f"{summary['missing']} not in your copy", 8000
             )
 
         # ---- playback ----------------------------------------------------- #
@@ -1639,6 +1974,109 @@ def selftest() -> int:
         check("removed from fp_cache", lib.fp_cache == {})
         check("removed from path_by_fp", "b" not in lib.path_by_fp)
         check("untouched entries remain", "a" in lib.videos and "c" in lib.videos)
+
+    print("13. youtube_id extraction")
+    check("watch?v=", youtube_id("https://www.youtube.com/watch?v=dQw4w9WgXcQ") == "dQw4w9WgXcQ")
+    check("watch?v= with extra params",
+          youtube_id("https://youtube.com/watch?v=dQw4w9WgXcQ&t=42s&list=x") == "dQw4w9WgXcQ")
+    check("youtu.be short link",
+          youtube_id("https://youtu.be/dQw4w9WgXcQ?si=abc") == "dQw4w9WgXcQ")
+    check("/shorts/", youtube_id("https://www.youtube.com/shorts/dQw4w9WgXcQ") == "dQw4w9WgXcQ")
+    check("non-YouTube -> None", youtube_id("https://example.com/video/123") is None)
+    check("None in -> None", youtube_id(None) is None)
+
+    print("14. library export / import round-trip + matching")
+    # Build a source library with two orders, curation, and video IDs.
+    src = Library(Path("/src"))
+    def mkv(fp, vid, title, season, date, override=None, watched=False, note=""):
+        v = default_video(title + ".mkv")
+        v.update(title=title, season=season, upload_date=date,
+                 upload_date_override=override, video_id=vid,
+                 url=(f"https://youtu.be/{vid}" if vid else None),
+                 watched=watched, note=note)
+        src.videos[fp] = v
+    mkv("fpA:1", "aaaaaaaaaaa", "Ep A", 1, "2016-01-01")
+    mkv("fpB:2", "bbbbbbbbbbb", "Ep B", 1, "2016-01-02", override="2016-01-05")
+    mkv("fpC:3", None, "Ep C (no id)", 2, "2016-01-03")
+    src.chrono_order = ["fpA:1", "fpB:2", "fpC:3"]
+    src.upload_order = ["fpA:1", "fpB:2", "fpC:3"]
+    payload = json.loads(json.dumps(src.export_library()))  # simulate file round-trip
+    check("export kind", payload["kind"] == "library-export")
+    check("export excludes personal fields",
+          all("note" not in ev and "watched" not in ev
+              for ev in payload["videos"].values()))
+
+    # Target library: same video IDs but DIFFERENT fingerprints (re-encodes),
+    # plus one ID-less file that is byte-identical (same fp as source), and
+    # local personal state that must survive.
+    tgt = Library(Path("/tgt"))
+    def tmkv(fp, vid, watched=False, note=""):
+        v = default_video("x.mkv")
+        v.update(video_id=vid, url=(f"https://youtu.be/{vid}" if vid else None),
+                 watched=watched, note=note)
+        tgt.videos[fp] = v
+    tmkv("zzzA:9", "aaaaaaaaaaa", watched=True, note="mine")  # matches A by ID
+    tmkv("zzzB:8", "bbbbbbbbbbb")                              # matches B by ID
+    tgt.videos["fpC:3"] = default_video("Ep C (no id).mkv")   # matches C by fingerprint
+    summary = tgt.import_library(payload, reset_orders=True)
+    check("matched all three", summary["matched"] == 3)
+    check("two matched by video_id", summary["by_video_id"] == 2)
+    check("one matched by fingerprint", summary["by_fingerprint"] == 1)
+    check("no missing", summary["missing"] == 0)
+    check("orders translated to local fingerprints",
+          tgt.chrono_order == ["zzzA:9", "zzzB:8", "fpC:3"])
+    check("curation applied (title/season)",
+          tgt.videos["zzzA:9"]["title"] == "Ep A" and tgt.videos["zzzB:8"]["season"] == 1)
+    check("date override applied", tgt.videos["zzzB:8"]["upload_date_override"] == "2016-01-05")
+    check("personal watched/notes preserved",
+          tgt.videos["zzzA:9"]["watched"] is True and tgt.videos["zzzA:9"]["note"] == "mine")
+    check("local url/video_id not overwritten",
+          tgt.videos["zzzA:9"]["video_id"] == "aaaaaaaaaaa")
+
+    # Missing videos, skip mode (default): a target that has only one of three.
+    tgt2 = Library(Path("/tgt2"))
+    tgt2.videos["only:1"] = {**default_video("x.mkv"), "video_id": "aaaaaaaaaaa"}
+    s2 = tgt2.import_library(payload, reset_orders=True)
+    check("missing counted", s2["matched"] == 1 and s2["missing"] == 2)
+    check("missing skipped by default", s2["skipped"] == 2 and s2["kept_offline"] == 0)
+    check("skipped videos dropped from order", tgt2.chrono_order == ["only:1"])
+
+    # Missing videos, keep-offline mode: placeholders created, ordered, offline.
+    tgt2b = Library(Path("/tgt2b"))
+    tgt2b.videos["only:1"] = {**default_video("x.mkv"), "video_id": "aaaaaaaaaaa"}
+    s2b = tgt2b.import_library(payload, reset_orders=True, keep_unmatched=True)
+    check("missing kept offline", s2b["kept_offline"] == 2 and s2b["skipped"] == 0)
+    check("placeholders keyed by exporter fingerprint",
+          "fpB:2" in tgt2b.videos and "fpC:3" in tgt2b.videos)
+    check("placeholders hold full order", tgt2b.chrono_order == ["only:1", "fpB:2", "fpC:3"])
+    check("placeholder is offline (no file on disk)", not tgt2b.is_online("fpB:2"))
+    check("placeholder seeded from file (title/id/date)",
+          tgt2b.videos["fpB:2"]["title"] == "Ep B"
+          and tgt2b.videos["fpB:2"]["video_id"] == "bbbbbbbbbbb"
+          and tgt2b.videos["fpB:2"]["upload_date_override"] == "2016-01-05")
+
+    # Merge mode keeps existing order and appends new matches.
+    tgt3 = Library(Path("/tgt3"))
+    tgt3.videos["zzzA:9"] = {**default_video("x.mkv"), "video_id": "aaaaaaaaaaa"}
+    tgt3.videos["fpC:3"] = default_video("c.mkv")
+    tgt3.chrono_order = ["fpC:3"]
+    tgt3.import_library(payload, reset_orders=False)
+    check("merge appends without reordering existing",
+          tgt3.chrono_order == ["fpC:3", "zzzA:9"])
+
+    print("15. video_id backfilled from url on load")
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        store = {
+            "schema_version": 2,
+            "videos": {"k1": {**default_video("k1.mkv"),
+                              "url": "https://youtu.be/ccccccccccc", "video_id": None}},
+        }
+        (root / STORE_NAME).write_text(json.dumps(store), encoding="utf-8")
+        lib = Library(root)
+        lib.load()
+        check("video_id derived from stored url",
+              lib.videos["k1"]["video_id"] == "ccccccccccc")
 
     print()
     if fails:
