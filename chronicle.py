@@ -169,6 +169,19 @@ def youtube_id(url: str | None) -> str | None:
     return m.group(1) if m else None
 
 
+def path_is_within(path: Path, root: Path) -> bool:
+    """True if `path` lies inside `root` (both resolved first), else False.
+
+    Used to warn when a reconnect targets a file outside the managed folder,
+    which scan can't see and would drop back to [offline] on the next launch.
+    """
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except (ValueError, OSError):
+        return False
+
+
 def read_embedded_meta(path: Path) -> dict:
     """Read upload date + source URL from a file's embedded tags via ffprobe.
 
@@ -586,6 +599,75 @@ class Library:
                 self.position[key] = None
         self.fp_cache = {k: v for k, v in self.fp_cache.items() if v.get("fp") != fp}
         self.path_by_fp.pop(fp, None)
+
+    def is_meaningful_entry(self, fp: str) -> bool:
+        """True if this entry is placed in an order or carries user data.
+
+        Distinguishes a fresh, blank auto-created scan entry (False) from one
+        the user has curated or placed (True). Used to spot a reconnect that
+        would land on an entry that already matters — a collision.
+        """
+        if fp in self.chrono_order or fp in self.upload_order:
+            return True
+        v = self.videos.get(fp, {})
+        return bool(v.get("note") or v.get("watched")
+                    or v.get("season") is not None
+                    or v.get("side_story") or v.get("upload_date_override"))
+
+    @staticmethod
+    def _rekey_list(order: list[str], stale: str, real: str) -> list[str]:
+        """Replace `stale` with `real` in an order, taking stale's slot.
+
+        Leaves the order untouched if `stale` isn't in it (the offline entry was
+        never placed in that order); otherwise drops any pre-existing `real` so
+        the merged entry ends up exactly where `stale` was, with no duplicate.
+        """
+        if stale not in order:
+            return list(order)
+        filtered = [fp for fp in order if fp != real]
+        return [real if fp == stale else fp for fp in filtered]
+
+    def reconnect(self, stale_fp: str, real_fp: str) -> None:
+        """Declare an offline entry (`stale_fp`) to be the on-disk video
+        `real_fp`, merging the two into a single entry keyed by the real file.
+
+        The offline entry's curation and personal state (title, season,
+        side-story, notes, watched, resume, last-opened, date override) and its
+        slot in each order move onto the real file. The real file keeps the
+        upload date / URL / video ID read from itself, falling back to the
+        offline entry's only where its own is missing. The stale entry is then
+        dropped. The video file is never touched.
+        """
+        if stale_fp == real_fp or stale_fp not in self.videos:
+            return
+        stale = self.videos[stale_fp]
+        real = self.videos.setdefault(real_fp, default_video(""))
+        for k in ("title", "season", "side_story", "note", "watched",
+                  "resume_seconds", "last_opened", "upload_date_override"):
+            real[k] = stale.get(k, real.get(k))
+        for k in ("upload_date", "url", "video_id"):
+            if not real.get(k) and stale.get(k):
+                real[k] = stale[k]
+        self.chrono_order = self._rekey_list(self.chrono_order, stale_fp, real_fp)
+        self.upload_order = self._rekey_list(self.upload_order, stale_fp, real_fp)
+        for key in self.position:
+            if self.position.get(key) == stale_fp:
+                self.position[key] = real_fp
+        self.videos.pop(stale_fp, None)
+        self.fp_cache = {k: v for k, v in self.fp_cache.items()
+                         if v.get("fp") != stale_fp}
+        self.path_by_fp.pop(stale_fp, None)
+
+    def register_online(self, fp: str, path: Path) -> None:
+        """Mark a fingerprint as present at `path` (as scan would), so a file the
+        user pointed us at is immediately playable without waiting for a rescan.
+        """
+        self.path_by_fp[fp] = path
+        try:
+            st = path.stat()
+            self.fp_cache[str(path)] = {"size": st.st_size, "mtime": st.st_mtime, "fp": fp}
+        except OSError:
+            pass
 
     def unsorted(self, name: str) -> list[str]:
         """Online videos that don't appear in the given order.
@@ -1331,6 +1413,9 @@ def run_gui(lib: Library) -> int:
             act_play.setEnabled(online and bool(player_exe))
             act_open = menu.addAction("Open containing folder")
             act_open.setEnabled(online)
+            act_reconnect = None
+            if not online:
+                act_reconnect = menu.addAction("Reconnect to on-disk video…")
             menu.addSeparator()
             act_watched = menu.addAction("Toggle watched")
             act_add = act_remove = None
@@ -1349,6 +1434,8 @@ def run_gui(lib: Library) -> int:
                 self.play(fp)
             elif chosen is act_open:
                 self.open_containing_folder(fp)
+            elif chosen is act_reconnect:
+                self.reconnect_entry(fp)
             elif chosen is act_watched:
                 self._toggle_watched(fp)
             elif chosen is act_add:
@@ -1365,6 +1452,127 @@ def run_gui(lib: Library) -> int:
                                     "This video is not currently on disk (offline).")
                 return
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.parent)))
+
+        # ---- reconnect an offline entry to an on-disk file --------------- #
+        def reconnect_entry(self, stale_fp: str):
+            stale_title = self.lib.videos.get(stale_fp, {}).get("title", stale_fp)
+            path_str, _ = QFileDialog.getOpenFileName(
+                self, f"Reconnect “{stale_title}” to a file on disk",
+                str(self.lib.root), "Videos (*.mkv);;All files (*)",
+            )
+            if not path_str:
+                return
+            path = Path(path_str)
+            try:
+                real_fp = fingerprint(path)
+            except OSError as e:
+                QMessageBox.warning(None, "Can't read file",
+                                    f"Could not read that file:\n{e}")
+                return
+
+            # A file outside the managed folder works now but scan can't see it,
+            # so it would fall back to [offline] next launch. Warn (don't block),
+            # and offer to move it into the library folder so it sticks.
+            if not path_is_within(path, self.lib.root):
+                dest = self.lib.root / path.name
+                box = QMessageBox(None)  # parentless: its X can't close the app
+                box.setWindowModality(Qt.ApplicationModal)
+                box.setIcon(QMessageBox.Warning)
+                box.setWindowTitle("File is outside your library folder")
+                box.setText(
+                    f"The file you picked is outside Chronicle's library folder:\n"
+                    f"{path}\n\nChronicle only tracks files under:\n{self.lib.root}\n\n"
+                    "You can use it as-is, but it will show as [offline] again after "
+                    "the next rescan. Moving it into the library folder keeps it "
+                    "connected for good."
+                )
+                move_btn = box.addButton("Move into library", QMessageBox.AcceptRole)
+                use_btn = box.addButton("Use anyway", QMessageBox.DestructiveRole)
+                box.addButton(QMessageBox.Cancel)
+                box.setDefaultButton(move_btn)
+                box.exec()
+                clicked = box.clickedButton()
+                if clicked is move_btn:
+                    if dest.exists():
+                        QMessageBox.warning(
+                            None, "Name already taken",
+                            f"There's already a file named “{path.name}” in the "
+                            "library folder. Move or rename it yourself, then retry.",
+                        )
+                        return
+                    try:
+                        shutil.move(str(path), str(dest))
+                    except OSError as e:
+                        QMessageBox.warning(None, "Move failed",
+                                            f"Could not move the file:\n{e}")
+                        return
+                    path = dest  # fingerprint is unchanged; real_fp still valid
+                    self.status.showMessage(f"Moved “{path.name}” into the library.", 4000)
+                elif clicked is not use_btn:
+                    return  # Cancel or dialog dismissed
+
+            # The offline entry's own file, simply back on disk — nothing to merge.
+            if real_fp == stale_fp:
+                self.lib.register_online(real_fp, path)
+                self.lib.save()
+                self.refresh_lists()
+                self._reselect(real_fp)
+                self.status.showMessage(f"“{stale_title}” is back on disk.", 5000)
+                return
+
+            # Decide collision BEFORE registering (a brand-new file isn't meaningful).
+            collision = self.lib.is_meaningful_entry(real_fp)
+            self.lib.register_online(real_fp, path)
+
+            if collision:
+                # Collision: the picked file is already a placed/curated entry.
+                real_title = self.lib.videos.get(real_fp, {}).get("title", real_fp)
+                sv = self.lib.videos.get(stale_fp, {}).get("video_id")
+                rv = self.lib.videos.get(real_fp, {}).get("video_id")
+                text = (
+                    f"The file you picked is already in your library as "
+                    f"“{real_title}”, placed or edited.\n\n"
+                    f"You're linking it to the offline entry “{stale_title}”."
+                )
+                if sv and sv == rv:
+                    text += ("\n\nThey share the same YouTube ID, so they're almost "
+                             "certainly the same video.")
+                text += (
+                    f"\n\n• Keep existing: delete the offline entry and leave "
+                    f"“{real_title}” exactly as it is.\n"
+                    "• Replace: move the offline entry's title, season, notes, "
+                    "watched-state and order position onto this file."
+                )
+                box = QMessageBox(None)  # parentless: its X can't close the app
+                box.setWindowModality(Qt.ApplicationModal)
+                box.setIcon(QMessageBox.Question)
+                box.setWindowTitle("Already in your library")
+                box.setText(text)
+                keep = box.addButton("Keep existing (delete offline)", QMessageBox.AcceptRole)
+                replace = box.addButton("Replace", QMessageBox.DestructiveRole)
+                box.addButton(QMessageBox.Cancel)
+                box.setDefaultButton(keep)
+                box.exec()
+                clicked = box.clickedButton()
+                if clicked is keep:
+                    self.lib.forget(stale_fp)
+                    msg = f"Deleted offline entry “{stale_title}”."
+                elif clicked is replace:
+                    self.lib.reconnect(stale_fp, real_fp)
+                    msg = f"Reconnected “{stale_title}” to the on-disk file."
+                else:
+                    return
+            else:
+                # Normal case: fresh, unplaced target — merge without prompting.
+                self.lib.reconnect(stale_fp, real_fp)
+                msg = f"Reconnected “{stale_title}” to the on-disk file."
+
+            if self._selected_fp == stale_fp:
+                self._selected_fp = real_fp
+            self.lib.save()
+            self.refresh_lists()
+            self._reselect(real_fp)
+            self.status.showMessage(msg, 5000)
 
         def delete_entry(self, fp: str):
             v = self.lib.videos.get(fp, {})
@@ -1452,10 +1660,20 @@ def run_gui(lib: Library) -> int:
                 "<b>open its containing folder</b> in your file manager, toggle "
                 "watched, add/remove it from the chronological order, or "
                 "<b>Delete entry</b>. Delete removes the episode's saved data and "
-                "its place in both orders — it <i>never</i> deletes the video file. "
-                "Use it to clear out a stale <code>[offline]</code> leftover after "
-                "you've re-downloaded an episode (a new download gets a new "
-                "fingerprint, so the old entry lingers as offline).</p>"
+                "its place in both orders — it <i>never</i> deletes the video file.</p>"
+                "<p>Right-clicking an <code>[offline]</code> episode also offers "
+                "<b>Reconnect to on-disk video…</b>. Chronicle recognizes files by "
+                "content, so a re-download at a different quality comes in as a new, "
+                "blank episode while the old one lingers as <code>[offline]</code>. "
+                "Reconnect lets you point the offline episode at that on-disk file: it "
+                "moves the offline episode's title, notes, watched-state and order "
+                "position onto the file, keeping the file's own upload date and link. "
+                "If the file you pick is already a placed or edited episode, Chronicle "
+                "warns you and lets you keep that one (just deleting the offline "
+                "leftover) or replace it. If you pick a file <i>outside</i> your library "
+                "folder, Chronicle warns you (it would go <code>[offline]</code> again on "
+                "the next rescan) and offers to move it into the folder so it stays "
+                "connected.</p>"
                 "<h4>Sharing a library</h4>"
                 "<p><b>Export library…</b> saves this collection's ordering and "
                 "curation (titles, seasons, side-story flags, date overrides) to a "
@@ -2077,6 +2295,75 @@ def selftest() -> int:
         lib.load()
         check("video_id derived from stored url",
               lib.videos["k1"]["video_id"] == "ccccccccccc")
+
+    print("16. reconnect an offline entry to an on-disk file")
+    lib = Library(Path("/recon"))
+    lib.videos["oldfp:1"] = {**default_video("old.mkv"), "title": "Curated",
+                             "season": 3, "note": "keep", "watched": True,
+                             "upload_date_override": "2016-02-02"}
+    lib.videos["newfp:9"] = {**default_video("new.mkv"),
+                             "upload_date": "2016-02-02", "video_id": "nnnnnnnnnnn"}
+    lib.chrono_order = ["oldfp:1"]
+    lib.upload_order = ["oldfp:1"]
+    lib.position = {"chrono": "oldfp:1", "upload": None}
+    lib.path_by_fp = {"newfp:9": Path("/recon/new.mkv")}  # only the new file is online
+    check("fresh blank target is not meaningful", not lib.is_meaningful_entry("newfp:9"))
+    check("placed+curated entry is meaningful", lib.is_meaningful_entry("oldfp:1"))
+    lib.reconnect("oldfp:1", "newfp:9")
+    check("stale entry removed", "oldfp:1" not in lib.videos)
+    check("curation/personal moved to real file",
+          lib.videos["newfp:9"]["title"] == "Curated"
+          and lib.videos["newfp:9"]["season"] == 3
+          and lib.videos["newfp:9"]["note"] == "keep"
+          and lib.videos["newfp:9"]["watched"] is True
+          and lib.videos["newfp:9"]["upload_date_override"] == "2016-02-02")
+    check("real file keeps its own video_id", lib.videos["newfp:9"]["video_id"] == "nnnnnnnnnnn")
+    check("order slots transferred",
+          lib.chrono_order == ["newfp:9"] and lib.upload_order == ["newfp:9"])
+    check("saved position repointed", lib.position["chrono"] == "newfp:9")
+
+    # Collision re-key: both entries already placed -> real takes stale's slot.
+    lib2 = Library(Path("/recon2"))
+    lib2.videos = {"s:1": default_video("s.mkv"), "r:2": default_video("r.mkv"),
+                   "z:3": default_video("z.mkv")}
+    lib2.chrono_order = ["z:3", "s:1", "r:2"]
+    lib2.reconnect("s:1", "r:2")
+    check("collision re-key takes stale slot, no duplicate", lib2.chrono_order == ["z:3", "r:2"])
+    check("_rekey_list leaves order without stale untouched",
+          Library._rekey_list(["a", "b"], "x", "b") == ["a", "b"])
+    check("fresh scan entry is not meaningful",
+          not Library(Path("/e")).is_meaningful_entry("nope"))
+
+    # register_online: a picked file becomes online + cached without a rescan.
+    with tempfile.TemporaryDirectory() as td:
+        lib = Library(Path(td))
+        f = Path(td) / "vid.mkv"
+        f.write_bytes(b"data")
+        fpv = fingerprint(f)
+        lib.register_online(fpv, f)
+        check("register_online marks fp online", lib.is_online(fpv))
+        check("register_online caches the path", str(f) in lib.fp_cache)
+
+    # Reconnect onto a brand-new fp (as a freshly picked, unknown file would be).
+    lib = Library(Path("/reconn3"))
+    lib.videos["off:1"] = {**default_video("o.mkv"), "title": "Kept", "note": "n"}
+    lib.chrono_order = ["off:1"]
+    check("brand-new fp is not meaningful", not lib.is_meaningful_entry("brand:2"))
+    lib.reconnect("off:1", "brand:2")
+    check("reconnect creates an entry for the brand-new fp",
+          "brand:2" in lib.videos and lib.videos["brand:2"]["title"] == "Kept")
+    check("brand-new reconnect transfers order and drops stale",
+          lib.chrono_order == ["brand:2"] and "off:1" not in lib.videos)
+
+    print("17. path_is_within (reconnect out-of-root guard)")
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        check("child path is within root", path_is_within(root / "sub" / "v.mkv", root))
+        check("root itself counts as within", path_is_within(root, root))
+        check("sibling path is outside root",
+              not path_is_within(root.parent / "elsewhere.mkv", root))
+        check("unrelated absolute path is outside",
+              not path_is_within(Path("/definitely/not/here.mkv"), root))
 
     print()
     if fails:

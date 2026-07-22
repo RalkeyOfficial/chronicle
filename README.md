@@ -224,7 +224,14 @@ To move your library to a new machine, copy the videos **and** `chronicle_librar
   by hand with **Override date**.
 - **A video shows `[offline]`** — the file isn't at its last-known path. Chronicle
   finds videos by content, so just make sure the folder is mounted/present and
-  re-launch; it'll reconnect automatically.
+  re-launch; it'll reconnect automatically. If instead you **re-downloaded** the video
+  (a different encode gets a new fingerprint, so it comes in as a fresh, blank entry
+  while the old one stays `[offline]`), **right-click the offline entry → Reconnect to
+  on-disk video…** and pick the new file. Its title, notes, watched-state and order
+  position move onto the file; if you pick one that's already a placed/edited entry,
+  Chronicle warns you and lets you keep that one or replace it. Picking a file **outside
+  your library folder** also works, but Chronicle warns you (it would go `[offline]`
+  again on the next rescan) and offers to **move it into the folder** so it stays put.
 - **An upload date is wrong** — tick **Override date** in Details and set the correct
   one.
 - **PySide6 import error on launch** — `pip install pyside6` (or `pacman -S pyside6`).
